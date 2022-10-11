@@ -1,2 +1,2 @@
-go build -o cfs main.go
-sudo ./cfs run /bin/echo hello
+go build -o cfs 
+sudo ./cfs run --command "/bin/echo hello"
