@@ -37,7 +37,7 @@ const stdioFdCount = 3
 
 func Run(ctx *cli.Context) {
 	command := ctx.String("command")
-	argv := append([]string{"--command"}, strings.Split(command, " ")...)
+	argv := append([]string{"--command"}, command)
 
 	fmt.Printf("cfs run... \n")
 	parentInitPipe, childInitPipe, err := NewSockPair("init")
@@ -46,10 +46,13 @@ func Run(ctx *cli.Context) {
 		panic(err)
 	}
 
+	messageSockPair := filePair{parentInitPipe, childInitPipe}
 	args := append([]string{"init"}, argv...)
 	cmd := exec.Command("/proc/self/exe", args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	messageSockPair := filePair{parentInitPipe, childInitPipe}
+	fmt.Printf("init command option is %s \n", args)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	cmd.ExtraFiles = append(cmd.ExtraFiles, childInitPipe)
 	cmd.Env = append(cmd.Env,
 		"_LIBCONTAINER_INITPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
@@ -157,6 +160,7 @@ func Initialization(ctx *cli.Context) {
 	command := ctx.String("command")
 	fmt.Printf("Running %v \n", command)
 	argv := strings.Split(command, " ")
+	fmt.Printf("split argv is %s\n", argv)
 
 	envInitPipe := os.Getenv("_LIBCONTAINER_INITPIPE")
 	pipefd, err := strconv.Atoi(envInitPipe)
@@ -168,6 +172,17 @@ func Initialization(ctx *cli.Context) {
 	pipe := os.NewFile(uintptr(pipefd), "pipe")
 	defer pipe.Close()
 	cg()
+
+	// var consoleSocket *os.File
+	// if envConsole := os.Getenv("_LIBCONTAINER_CONSOLE"); envConsole != "" {
+	// 	console, err := strconv.Atoi(envConsole)
+	// 	if err != nil {
+	// 		return fmt.Errorf("unable to convert _LIBCONTAINER_CONSOLE: %w", err)
+	// 	}
+	// 	consoleSocket = os.NewFile(uintptr(console), "console-socket")
+	// 	defer consoleSocket.Close()
+	// }
+
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
