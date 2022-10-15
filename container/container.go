@@ -5,14 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sys/unix"
 )
@@ -35,70 +36,164 @@ type pid struct {
 
 const stdioFdCount = 3
 
-func Run(ctx *cli.Context) {
+func Run(ctx *cli.Context) error {
 	command := ctx.String("command")
 	argv := append([]string{"--command"}, command)
 
-	fmt.Printf("cfs run... \n")
+	fmt.Println("cfs run...")
 	parentInitPipe, childInitPipe, err := NewSockPair("init")
 	if err != nil {
-		fmt.Printf("unable to create init pipe")
-		panic(err)
+		return fmt.Errorf("unable to create init pipe: %s", err)
 	}
 
 	messageSockPair := filePair{parentInitPipe, childInitPipe}
+
+	fmt.Println("creating fifo")
+	//TODO: 本当はrootオプションの直下に作成する
+	fifoName := "tmp/exec.fifo"
+	if _, err := os.Stat(fifoName); err == nil {
+		return fmt.Errorf("exec fifo %s already exists", fifoName)
+	}
+
+	oldMask := unix.Umask(0o000)
+	if err := unix.Mkfifo(fifoName, 0o622); err != nil {
+		unix.Umask(oldMask)
+		return err
+	}
+	unix.Umask(oldMask)
+	// if err := os.Chown(fifoName, 1, 1); err != nil {
+	// 	return fmt.Errorf("exec fifo %s chown failed", fifoName)
+	// }
+
+	// newParentProcess()の中で、fifoを開いてそれをExtraFilesに加えたcmdが作成される。
+	fmt.Println("opening fifo")
+	fifo, err := os.OpenFile(fifoName, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("exec fifo %s open failed", fifoName)
+	}
 	args := append([]string{"init"}, argv...)
 	cmd := exec.Command("/proc/self/exe", args...)
 	fmt.Printf("init command option is %s \n", args)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	// stdin, stdout, stderr, childInitPipe, fifofdの順にfdを渡す
+	// Socketpairの子供側をExtraFilesの末尾に追加し、そのfdを環境変数に渡す
 	cmd.ExtraFiles = append(cmd.ExtraFiles, childInitPipe)
 	cmd.Env = append(cmd.Env,
 		"_LIBCONTAINER_INITPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
+	// fifoをExtraFilesの末尾に追加し、そのfdを環境変数に渡す
+	cmd.ExtraFiles = append(cmd.ExtraFiles, fifo)
+	cmd.Env = append(cmd.Env,
+		"_LIBCONTAINER_FIFOFD="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
 
 	init := &initProcess{
 		cmd:             cmd,
 		messageSockPair: messageSockPair,
 	}
-	init.start()
+	if err := init.start(); err != nil {
+		os.Remove(fifoName)
+		return err
+	}
+
+	fifo.Close()
+	blockingFifoOpenCh := awaitFifoOpen(fifoName)
+	for {
+		select {
+		case result := <-blockingFifoOpenCh:
+			return handleFifoResult(result)
+		case <-time.After(time.Microsecond * 100):
+			if err := handleFifoResult(fifoOpen(fifoName, false)); err != nil {
+				return errors.New("container process is already dead")
+			}
+			return nil
+		}
+	}
+
+}
+
+type openResult struct {
+	file *os.File
+	err  error
+}
+
+func awaitFifoOpen(path string) <-chan openResult {
+	fifoOpened := make(chan openResult)
+	go func() {
+		result := fifoOpen(path, true)
+		fifoOpened <- result
+	}()
+	return fifoOpened
+}
+
+func fifoOpen(path string, block bool) openResult {
+	flags := os.O_RDONLY
+	if !block {
+		flags |= unix.O_NONBLOCK
+	}
+	f, err := os.OpenFile(path, flags, 0)
+	if err != nil {
+		return openResult{err: fmt.Errorf("exec fifo: %w", err)}
+	}
+	return openResult{file: f}
+}
+
+func handleFifoResult(result openResult) error {
+	if result.err != nil {
+		return result.err
+	}
+	f := result.file
+	defer f.Close()
+	if err := readFromExecFifo(f); err != nil {
+		return err
+	}
+	return os.Remove(f.Name())
+}
+
+func readFromExecFifo(execFifo io.Reader) error {
+	data, err := io.ReadAll(execFifo)
+	if err != nil {
+		return err
+	}
+	if len(data) <= 0 {
+		return errors.New("cannot start an already running container")
+	}
+	return nil
 }
 
 /*
   cfs run(=runc run)から、cfs init(=runc init)を実行する
 */
-func (p *initProcess) start() {
-	Must(p.cmd.Run())
+func (p *initProcess) start() error {
+	return p.cmd.Run()
 }
 
-/*
-func (p *initProcess) start() {
-	defer p.messageSockPair.parent.Close()
-	err := p.cmd.Start()
-	_ = p.messageSockPair.child.Close()
-	if err != nil {
-		fmt.Printf("initProcess start failed: %s", err)
-		panic(err)
-	}
-	// waitInit := initWaiter(p.messageSockPair.parent)
-	// err = <-waitInit
-	// if err != nil {
-	// 	panic(err)
-	// }
+// func (p *initProcess) start() {
+// 	defer p.messageSockPair.parent.Close()
+// 	err := p.cmd.Start()
+// 	_ = p.messageSockPair.child.Close()
+// 	if err != nil {
+// 		fmt.Printf("initProcess start failed: %s", err)
+// 		panic(err)
+// 	}
+// 	waitInit := initWaiter(p.messageSockPair.parent)
+// 	err = <-waitInit
+// 	if err != nil {
+// 		panic(err)
+// 	}
 
-	childPid, err := p.getChildPid()
-	if err != nil {
-		fmt.Printf("childPid: %s\n", err)
-		panic(err)
-	}
-	fds, err := getPipeFds(childPid)
-	if err != nil {
-		fmt.Printf("error getting pipe fds for pid: %d", childPid)
-		panic(err)
-	}
-	p.fds = fds
-}
-*/
+// 	childPid, err := p.getChildPid()
+// 	if err != nil {
+// 		fmt.Printf("childPid: %s\n", err)
+// 		panic(err)
+// 	}
+// 	fds, err := getPipeFds(childPid)
+// 	if err != nil {
+// 		fmt.Printf("error getting pipe fds for pid: %d", childPid)
+// 		panic(err)
+// 	}
+// 	p.fds = fds
+// }
 
 func initWaiter(r io.Reader) chan error {
 	ch := make(chan error, 1)
@@ -156,7 +251,7 @@ func setupNetwork() {
 }
 
 // cfs init(=runc init)の実体
-func Initialization(ctx *cli.Context) {
+func Initialization(ctx *cli.Context) error {
 	command := ctx.String("command")
 	fmt.Printf("Running %v \n", command)
 	argv := strings.Split(command, " ")
@@ -165,25 +260,61 @@ func Initialization(ctx *cli.Context) {
 	envInitPipe := os.Getenv("_LIBCONTAINER_INITPIPE")
 	pipefd, err := strconv.Atoi(envInitPipe)
 	if err != nil {
-		err = fmt.Errorf("unable to convert _LIBCONTAINER_INITPIPE: %w", err)
-		fmt.Printf("convert %s", err)
-		panic(err)
+		return fmt.Errorf("unable to convert _LIBCONTAINER_INITPIPE: %w", err)
 	}
 	pipe := os.NewFile(uintptr(pipefd), "pipe")
 	defer pipe.Close()
-	cg()
 
-	// var consoleSocket *os.File
-	// if envConsole := os.Getenv("_LIBCONTAINER_CONSOLE"); envConsole != "" {
-	// 	console, err := strconv.Atoi(envConsole)
-	// 	if err != nil {
-	// 		return fmt.Errorf("unable to convert _LIBCONTAINER_CONSOLE: %w", err)
-	// 	}
-	// 	consoleSocket = os.NewFile(uintptr(console), "console-socket")
-	// 	defer consoleSocket.Close()
-	// }
+	//QUESTIONING pipe.Close()の直前に、initPipeにprocErrorを書き込む。fdは-1。なんで？
+	defer func() {
+		if werr := writeSyncWithFd(pipe, procError, -1); werr != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return
+		}
+		if werr := utils.WriteJSON(pipe, &initError{Message: err.Error()}); werr != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return
+		}
+	}()
 
+	/* QUESTIONING なんでfdを-1にするのか
+	*  initではなくsetnsの場合は、fifofdは使わない。それを明示するために？-1を入れてるのかな。
+	*  どうせfifofdには値が代入されるし。
+	 */
+	fifofd := -1
+	envFifoFd := os.Getenv("_LIBCONTAINER_FIFOFD")
+	fmt.Println("fifofd setting finished")
+	//TODO: add console socket
+	//TODO: add logpipe
+	//TODO: parse mount fd
+
+	// os.Clearenv()
+
+	/*==============以降、standard_init_linux.go Init()の再現 =================
+	*
+	 */
+
+	//TODO: setupnetwork
+	//TODO: setuproute
+	//TODO: prepareRootfs
+	//TODO: createConsole
+	fmt.Printf("setting /proc/self/fd/%s", envFifoFd)
+	fifoPath := "/proc/self/fd/" + envFifoFd
+	// Tips: ここで、fifoがもう一方から開かれるのを待ち受ける。
+	fd, err := unix.Open(fifoPath, unix.O_WRONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		fmt.Printf("error is %s", err)
+		return &os.PathError{Op: "open exec fifo", Path: fifoPath, Err: err}
+	}
+	fmt.Println("sending fifofd 0")
+	if _, err := unix.Write(fd, []byte("0")); err != nil {
+		fmt.Printf("error is %s", err)
+		return &os.PathError{Op: "write exec fifo", Path: fifoPath, Err: err}
+	}
+	fmt.Println("/proc/self/fd closing")
+	_ = unix.Close(fifofd)
 	cmd := exec.Command(argv[0], argv[1:]...)
+	fmt.Printf("cmd is %s", cmd)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -203,50 +334,7 @@ func Initialization(ctx *cli.Context) {
 	Must(syscall.Chroot("/"))
 	Must(os.Chdir("/"))
 	Must(cmd.Run())
-	/*
-		簡単な方の実装
-		// Must(syscall.Sethostname([]byte("container")))
-		// Must(syscall.Chroot("/"))
-		// Must(os.Chdir("/"))
-		// Must(syscall.Mount("proc", "proc", "proc", 0, ""))
-		// Must(cmd.Run())
-		// Must(syscall.Unmount("proc", 0))
-	*/
-
-	/*
-		Init()の中の最後の処理
-		fifoPath := "/proc/self/fd/" + strconv.Itoa(l.fifoFd)
-		fd, err := unix.Open(fifoPath, unix.O_WRONLY|unix.O_CLOEXEC, 0)
-		if err != nil {
-			return &os.PathError{Op: "open exec fifo", Path: fifoPath, Err: err}
-		}
-		if _, err := unix.Write(fd, []byte("0")); err != nil {
-			return &os.PathError{Op: "write exec fifo", Path: fifoPath, Err: err}
-		}
-
-		_ = unix.Close(l.fifoFd)
-
-		s := l.config.SpecState
-		s.Pid = unix.Getpid()
-		s.Status = specs.StateCreated
-		if err := l.config.Config.Hooks[configs.StartContainer].RunHooks(s); err != nil {
-			return err
-		}
-
-		return system.Exec(name, l.config.Args[0:], os.Environ())
-	*/
-}
-
-func cg() {
-	cgroups := "/sys/fs/cgroup/"
-	pids := filepath.Join(cgroups, "pids")
-	cgPath := filepath.Join(pids, "cfs")
-	if !Exists(cgPath) {
-		Must(os.Mkdir(filepath.Join(pids, "cfs"), 0755))
-	}
-	Must(ioutil.WriteFile(filepath.Join(pids, "cfs/pids.max"), []byte("20"), 0700))
-	Must(ioutil.WriteFile(filepath.Join(pids, "cfs/notify_on_release"), []byte("1"), 0700))
-	Must(ioutil.WriteFile(filepath.Join(pids, "cfs/cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0700))
+	return nil
 }
 
 func Must(err error) {
@@ -271,4 +359,26 @@ func NewSockPair(name string) (parent *os.File, child *os.File, err error) {
 		return nil, nil, err
 	}
 	return os.NewFile(uintptr(fds[1]), name+"-p"), os.NewFile(uintptr(fds[0]), name+"-c"), nil
+}
+
+type syncType string
+
+const (
+	procError syncType = "procError"
+)
+
+type syncT struct {
+	Type syncType `json:"type"`
+	Fd   int      `json:"fd"`
+}
+
+func writeSyncWithFd(pipe io.Writer, sync syncType, fd int) error {
+	if err := utils.WriteJSON(pipe, syncT{sync, fd}); err != nil {
+		return fmt.Errorf("writing syncT %q: %w", string(sync), err)
+	}
+	return nil
+}
+
+type initError struct {
+	Message string `json:"message,omitempty"`
 }
