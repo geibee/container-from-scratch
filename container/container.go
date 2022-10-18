@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,6 +28,8 @@ type initProcess struct {
 	cmd             *exec.Cmd
 	messageSockPair filePair
 	fds             []string
+	fifo            *os.File
+	m               sync.Mutex
 }
 
 type pid struct {
@@ -90,9 +93,14 @@ func Run(ctx *cli.Context) error {
 	init := &initProcess{
 		cmd:             cmd,
 		messageSockPair: messageSockPair,
+		fifo:            fifo,
 	}
-	if err := init.start(); err != nil {
-		os.Remove(fifoName)
+
+	// if err := init.start(); err != nil {
+	// 	os.Remove(fifoName)
+	// 	return err
+	// }
+	if err := Start(init); err != nil {
 		return err
 	}
 
@@ -164,36 +172,41 @@ func readFromExecFifo(execFifo io.Reader) error {
 /*
   cfs run(=runc run)から、cfs init(=runc init)を実行する
 */
+
 func (p *initProcess) start() error {
-	return p.cmd.Run()
+	defer p.messageSockPair.parent.Close()
+	err := p.cmd.Start()
+	//Tips: 親側のプロセスではSocketpairの子側はいらないから閉じる
+	_ = p.messageSockPair.child.Close()
+	if err != nil {
+		return fmt.Errorf("initProcess start failed: %w", err)
+	}
+
+	//Tips: 子側がSockpairに何か送ってきてるか確認し、何も送ってきてなかったらエラーにする
+	waitInit := initWaiter(p.messageSockPair.parent)
+	err = <-waitInit
+	defer func() {
+		if err != nil {
+			fmt.Printf("child side sends nothing")
+		}
+	}()
+	if err != nil {
+		return err
+	}
+
+	childPid, err := p.getChildPid()
+	if err != nil {
+		fmt.Printf("childPid: %s\n", err)
+		panic(err)
+	}
+	fds, err := getPipeFds(childPid)
+	if err != nil {
+		fmt.Printf("error getting pipe fds for pid: %d", childPid)
+		panic(err)
+	}
+	p.fds = fds
+	return nil
 }
-
-// func (p *initProcess) start() {
-// 	defer p.messageSockPair.parent.Close()
-// 	err := p.cmd.Start()
-// 	_ = p.messageSockPair.child.Close()
-// 	if err != nil {
-// 		fmt.Printf("initProcess start failed: %s", err)
-// 		panic(err)
-// 	}
-// 	waitInit := initWaiter(p.messageSockPair.parent)
-// 	err = <-waitInit
-// 	if err != nil {
-// 		panic(err)
-// 	}
-
-// 	childPid, err := p.getChildPid()
-// 	if err != nil {
-// 		fmt.Printf("childPid: %s\n", err)
-// 		panic(err)
-// 	}
-// 	fds, err := getPipeFds(childPid)
-// 	if err != nil {
-// 		fmt.Printf("error getting pipe fds for pid: %d", childPid)
-// 		panic(err)
-// 	}
-// 	p.fds = fds
-// }
 
 func initWaiter(r io.Reader) chan error {
 	ch := make(chan error, 1)
@@ -294,27 +307,27 @@ func Initialization(ctx *cli.Context) error {
 	*
 	 */
 
-	//TODO: setupnetwork
-	//TODO: setuproute
-	//TODO: prepareRootfs
-	//TODO: createConsole
-	fmt.Printf("setting /proc/self/fd/%s", envFifoFd)
+	fmt.Printf("setting /proc/self/fd/%s\n", envFifoFd)
 	fifoPath := "/proc/self/fd/" + envFifoFd
 	// Tips: ここで、fifoがもう一方から開かれるのを待ち受ける。
 	fd, err := unix.Open(fifoPath, unix.O_WRONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		fmt.Printf("error is %s", err)
+		fmt.Println("open failed")
 		return &os.PathError{Op: "open exec fifo", Path: fifoPath, Err: err}
 	}
 	fmt.Println("sending fifofd 0")
 	if _, err := unix.Write(fd, []byte("0")); err != nil {
-		fmt.Printf("error is %s", err)
+		fmt.Println("write failed")
 		return &os.PathError{Op: "write exec fifo", Path: fifoPath, Err: err}
 	}
 	fmt.Println("/proc/self/fd closing")
 	_ = unix.Close(fifofd)
+	//TODO: setupnetwork
+	//TODO: setuproute
+	//TODO: prepareRootfs
+	//TODO: createConsole
 	cmd := exec.Command(argv[0], argv[1:]...)
-	fmt.Printf("cmd is %s", cmd)
+	fmt.Printf("cmd is %s\n", cmd)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -381,4 +394,14 @@ func writeSyncWithFd(pipe io.Writer, sync syncType, fd int) error {
 
 type initError struct {
 	Message string `json:"message,omitempty"`
+}
+
+func Start(process *initProcess) error {
+	process.m.Lock()
+	defer process.m.Unlock()
+	if err := process.start(); err != nil {
+		os.Remove("tmp/exec.fifo")
+		return err
+	}
+	return nil
 }
