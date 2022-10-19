@@ -307,6 +307,11 @@ func Initialization(ctx *cli.Context) error {
 	*
 	 */
 
+	// 親プロセスとつながったSocketPairの子供側に書き込む。これによって、runc runの親プロセスのソケットが先に進む
+	if err := writeSyncWithFd(pipe, procReady, -1); err != nil {
+		return fmt.Errorf("sync ready: %w", err)
+	}
+	_ = pipe.Close()
 	fmt.Printf("setting /proc/self/fd/%s\n", envFifoFd)
 	fifoPath := "/proc/self/fd/" + envFifoFd
 	// Tips: ここで、fifoがもう一方から開かれるのを待ち受ける。
@@ -378,6 +383,7 @@ type syncType string
 
 const (
 	procError syncType = "procError"
+	procReady syncType = "procReady"
 )
 
 type syncT struct {
