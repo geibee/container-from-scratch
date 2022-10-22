@@ -182,8 +182,16 @@ func (p *initProcess) start() error {
 		return fmt.Errorf("initProcess start failed: %w", err)
 	}
 
+	// bootstrapdata stub
+	testrd := os.NewFile(uintptr(5), "test-reader")
+	testrd.Write([]byte("0"))
+
 	//Tips: 子側がSockpairに何か送ってきてるか確認し、何も送ってきてなかったらエラーにする
 	waitInit := initWaiter(p.messageSockPair.parent)
+	if _, err := io.Copy(p.messageSockPair.parent, testrd); err != nil {
+		fmt.Println("io.Copy")
+		return fmt.Errorf("can't copy bootstrap data to pipe: %w", err)
+	}
 	err = <-waitInit
 	defer func() {
 		if err != nil {
@@ -191,6 +199,7 @@ func (p *initProcess) start() error {
 		}
 	}()
 	if err != nil {
+		fmt.Println("initwaiter fails")
 		return err
 	}
 
@@ -201,10 +210,21 @@ func (p *initProcess) start() error {
 	}
 	fds, err := getPipeFds(childPid)
 	if err != nil {
-		fmt.Printf("error getting pipe fds for pid: %d", childPid)
+		fmt.Printf("error getting pipe fds for pid: %d\n", childPid)
 		panic(err)
 	}
 	p.fds = fds
+
+	err = p.cmd.Wait()
+	if err != nil {
+		fmt.Println("p.cmd.Wait() failed.")
+		return err
+	}
+
+	if err := unix.Shutdown(int(p.messageSockPair.parent.Fd()), unix.SHUT_WR); err != nil {
+		return &os.PathError{Op: "shutdown", Path: "(init pipe)", Err: err}
+	}
+
 	return nil
 }
 
@@ -216,10 +236,14 @@ func initWaiter(r io.Reader) chan error {
 		n, err := r.Read(inited)
 		if err == nil {
 			if n < 1 {
+				fmt.Println("short read")
 				err = errors.New("short read")
 			} else if inited[0] != 0 {
+				fmt.Println("inited[0] != 0")
+				fmt.Printf("init[0] is %s\n", inited[0])
 				err = fmt.Errorf("unexpected %d != 0", inited[0])
 			} else {
+				fmt.Println("ok")
 				ch <- nil
 				return
 			}
@@ -290,6 +314,14 @@ func Initialization(ctx *cli.Context) error {
 		}
 	}()
 
+	// syncParentReady
+	if err := writeSyncWithFd(pipe, procReady, -1); err != nil {
+		fmt.Println("syncParentReady failed.")
+		fmt.Printf("syncParentReady %s\n", err)
+		return err
+	}
+	fmt.Println("syncParentReady finished.")
+
 	/* QUESTIONING なんでfdを-1にするのか
 	*  initではなくsetnsの場合は、fifofdは使わない。それを明示するために？-1を入れてるのかな。
 	*  どうせfifofdには値が代入されるし。
@@ -309,6 +341,7 @@ func Initialization(ctx *cli.Context) error {
 
 	// 親プロセスとつながったSocketPairの子供側に書き込む。これによって、runc runの親プロセスのソケットが先に進む
 	if err := writeSyncWithFd(pipe, procReady, -1); err != nil {
+		fmt.Println("error writing pipefd")
 		return fmt.Errorf("sync ready: %w", err)
 	}
 	_ = pipe.Close()
