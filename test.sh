@@ -1,4 +1,5 @@
-rm tmp/exec.fifo
+rm tmp/exec.fifo > /dev/null 2>&1
+rm ./cfs > /dev/null 2>&1
 if ls rootfs > /dev/null 2>&1; then
     echo "rootfs" exists
 else
@@ -7,5 +8,6 @@ else
     tar xf rootfs.tar -C rootfs
     rm rootfs.tar
 fi
+str="$(IFS=,; echo "${@}")"
 go build -o cfs 
-sudo ./cfs run --command "/bin/echo hello"
+sudo ./cfs run --command "$str"
