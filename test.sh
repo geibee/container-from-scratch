@@ -5,6 +5,7 @@ if ls rootfs > /dev/null 2>&1; then
 else
     docker run --rm -d --name ubuntu ubuntu:18.04 tail -f /dev/null
     docker export ubuntu > rootfs.tar
+    docker kill ubuntu
     tar xf rootfs.tar -C rootfs
     rm rootfs.tar
 fi
