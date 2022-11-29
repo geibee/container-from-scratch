@@ -196,7 +196,7 @@ func Initialization(ctx *cli.Context) {
 		prepareRootfs()の簡易的な実装
 	*/
 	flag := unix.MS_SLAVE | unix.MS_REC
-	Must(unix.Sethostname([]byte("container")))
+	//Must(unix.Sethostname([]byte("container")))
 	Must(unix.Mount("", "/", "", uintptr(flag), ""))
 	Must(unix.Mount("rootfs", "/", "bind", unix.MS_BIND|unix.MS_REC, ""))
 	Must(unix.Mount("proc", "/proc", "proc", 0, ""))
