@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sys/unix"
 )
@@ -322,9 +321,14 @@ type syncT struct {
 }
 
 func writeSyncWithFd(pipe io.Writer, sync syncType, fd int) error {
-	if err := utils.WriteJSON(pipe, syncT{sync, fd}); err != nil {
+	inited := make([]byte, 1)
+	inited[0] = 0
+	if _, err := pipe.Write(inited); err != nil {
 		return fmt.Errorf("[parent] writing syncT %q: %w", string(sync), err)
 	}
+	// if err := utils.WriteJSON(pipe, syncT{sync, fd}); err != nil {
+	// return fmt.Errorf("[parent] writing syncT %q: %w", string(sync), err)
+	// }
 	return nil
 }
 

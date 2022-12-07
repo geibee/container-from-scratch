@@ -62,6 +62,7 @@ func Initialization(ctx *cli.Context) error {
 		fmt.Printf("[child] error is %s\n", err)
 		return fmt.Errorf("[child] sync ready: %w", err)
 	}
+	fmt.Println("[child] writed to child side of sockpair")
 	_ = pipe.Close()
 	fmt.Printf("[child] setting /proc/self/fd/%s\n", envFifoFd)
 	fifoPath := "/proc/self/fd/" + envFifoFd
