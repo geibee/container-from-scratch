@@ -41,19 +41,19 @@ func Run(ctx *cli.Context) error {
 	command := ctx.String("command")
 	argv := append([]string{"--command"}, command)
 
-	fmt.Println("cfs run...")
+	fmt.Println("[parent] cfs run...")
 	parentInitPipe, childInitPipe, err := NewSockPair("init")
 	if err != nil {
-		return fmt.Errorf("unable to create init pipe: %s", err)
+		return fmt.Errorf("[parent] unable to create init pipe: %s", err)
 	}
 
 	messageSockPair := filePair{parentInitPipe, childInitPipe}
 
-	fmt.Println("creating fifo")
+	fmt.Println("[parent] creating fifo")
 	//TODO: 本当はrootオプションの直下に作成する
 	fifoName := "tmp/exec.fifo"
 	if _, err := os.Stat(fifoName); err == nil {
-		return fmt.Errorf("exec fifo %s already exists", fifoName)
+		return fmt.Errorf("[parent] exec fifo %s already exists", fifoName)
 	}
 
 	oldMask := unix.Umask(0o000)
@@ -67,14 +67,14 @@ func Run(ctx *cli.Context) error {
 	// }
 
 	// newParentProcess()の中で、fifoを開いてそれをExtraFilesに加えたcmdが作成される。
-	fmt.Println("opening fifo")
+	fmt.Println("[parent] opening fifo")
 	fifo, err := os.OpenFile(fifoName, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("exec fifo %s open failed", fifoName)
+		return fmt.Errorf("[parent] exec fifo %s open failed", fifoName)
 	}
 	args := append([]string{"init"}, argv...)
 	cmd := exec.Command("/proc/self/exe", args...)
-	fmt.Printf("init command option is %s \n", args)
+	fmt.Printf("[parent] init command option is %s \n", args)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -110,7 +110,7 @@ func Run(ctx *cli.Context) error {
 			return handleFifoResult(result)
 		case <-time.After(time.Microsecond * 100):
 			if err := handleFifoResult(fifoOpen(fifoName, false)); err != nil {
-				return errors.New("container process is already dead")
+				return errors.New("[parent] container process is already dead")
 			}
 			return nil
 		}
@@ -139,7 +139,7 @@ func fifoOpen(path string, block bool) openResult {
 	}
 	f, err := os.OpenFile(path, flags, 0)
 	if err != nil {
-		return openResult{err: fmt.Errorf("exec fifo: %w", err)}
+		return openResult{err: fmt.Errorf("[parent] exec fifo: %w", err)}
 	}
 	return openResult{file: f}
 }
@@ -162,7 +162,7 @@ func readFromExecFifo(execFifo io.Reader) error {
 		return err
 	}
 	if len(data) <= 0 {
-		return errors.New("cannot start an already running container")
+		return errors.New("[parent] cannot start an already running container")
 	}
 	return nil
 }
@@ -177,7 +177,7 @@ func (p *initProcess) start() error {
 	//Tips: 親側のプロセスではSocketpairの子側はいらないから閉じる
 	_ = p.messageSockPair.child.Close()
 	if err != nil {
-		return fmt.Errorf("initProcess start failed: %w", err)
+		return fmt.Errorf("[parent] initProcess start failed: %w", err)
 	}
 
 	//Tips: 子側がSockpairに何か送ってきてるか確認し、何も送ってきてなかったらエラーにする
@@ -193,29 +193,29 @@ func (p *initProcess) start() error {
 	err = <-waitInit
 	defer func() {
 		if err != nil {
-			fmt.Printf("child side sends nothing")
+			fmt.Printf("[parent] child side sends nothing")
 		}
 	}()
 	if err != nil {
-		fmt.Println("initwaiter fails")
+		fmt.Println("[parent] initwaiter fails")
 		return err
 	}
 
 	childPid, err := p.getChildPid()
 	if err != nil {
-		fmt.Printf("childPid: %s\n", err)
+		fmt.Printf("[parent] childPid: %s\n", err)
 		panic(err)
 	}
 	fds, err := getPipeFds(childPid)
 	if err != nil {
-		fmt.Printf("error getting pipe fds for pid: %d\n", childPid)
+		fmt.Printf("[parent] error getting pipe fds for pid: %d\n", childPid)
 		panic(err)
 	}
 	p.fds = fds
 
 	err = p.cmd.Wait()
 	if err != nil {
-		fmt.Println("p.cmd.Wait() failed.")
+		fmt.Println("[parent] p.cmd.Wait() failed.")
 		return err
 	}
 
@@ -234,18 +234,18 @@ func initWaiter(r io.Reader) chan error {
 		n, err := r.Read(inited)
 		if err == nil {
 			if n < 1 {
-				fmt.Println("short read")
-				err = errors.New("short read")
+				fmt.Println("[parent] short read")
+				err = errors.New("[parent] short read")
 			} else if inited[0] != 0 {
-				fmt.Printf("init[0] is %s\n", inited[0])
-				err = fmt.Errorf("unexpected %d != 0", inited[0])
+				fmt.Printf("[parent] init[0] is %s\n", inited[0])
+				err = fmt.Errorf("[parent] unexpected %d != 0", inited[0])
 			} else {
-				fmt.Println("ok")
+				fmt.Println("[parent] ok")
 				ch <- nil
 				return
 			}
 		}
-		ch <- fmt.Errorf("waiting for init preliminary setup: %w", err)
+		ch <- fmt.Errorf("[parent] waiting for init preliminary setup: %w", err)
 	}()
 	return ch
 }
@@ -323,7 +323,7 @@ type syncT struct {
 
 func writeSyncWithFd(pipe io.Writer, sync syncType, fd int) error {
 	if err := utils.WriteJSON(pipe, syncT{sync, fd}); err != nil {
-		return fmt.Errorf("writing syncT %q: %w", string(sync), err)
+		return fmt.Errorf("[parent] writing syncT %q: %w", string(sync), err)
 	}
 	return nil
 }

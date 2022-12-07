@@ -16,14 +16,14 @@ import (
 // cfs init(=runc init)の実体
 func Initialization(ctx *cli.Context) error {
 	command := ctx.String("command")
-	fmt.Printf("Running %v \n", command)
+	fmt.Printf("[child] Running %v \n", command)
 	argv := strings.Split(command, " ")
-	fmt.Printf("split argv is %s\n", argv)
+	fmt.Printf("[child] split argv is %s\n", argv)
 
 	envInitPipe := os.Getenv("_LIBCONTAINER_INITPIPE")
 	pipefd, err := strconv.Atoi(envInitPipe)
 	if err != nil {
-		return fmt.Errorf("unable to convert _LIBCONTAINER_INITPIPE: %w", err)
+		return fmt.Errorf("[child] unable to convert _LIBCONTAINER_INITPIPE: %w", err)
 	}
 	pipe := os.NewFile(uintptr(pipefd), "pipe")
 	defer pipe.Close()
@@ -46,7 +46,7 @@ func Initialization(ctx *cli.Context) error {
 	 */
 	fifofd := -1
 	envFifoFd := os.Getenv("_LIBCONTAINER_FIFOFD")
-	fmt.Println("fifofd setting finished")
+	fmt.Println("[child] fifofd setting finished")
 	//TODO: add console socket
 	//TODO: add logpipe
 	//TODO: parse mount fd
@@ -59,31 +59,31 @@ func Initialization(ctx *cli.Context) error {
 
 	// 親プロセスとつながったSocketPairの子供側に書き込む。これによって、runc runの親プロセスのソケットが先に進む
 	if err := writeSyncWithFd(pipe, procReady, -1); err != nil {
-		fmt.Printf("error is %s\n", err)
-		return fmt.Errorf("sync ready: %w", err)
+		fmt.Printf("[child] error is %s\n", err)
+		return fmt.Errorf("[child] sync ready: %w", err)
 	}
 	_ = pipe.Close()
-	fmt.Printf("setting /proc/self/fd/%s\n", envFifoFd)
+	fmt.Printf("[child] setting /proc/self/fd/%s\n", envFifoFd)
 	fifoPath := "/proc/self/fd/" + envFifoFd
 	// Tips: ここで、fifoがもう一方から開かれるのを待ち受ける。
 	fd, err := unix.Open(fifoPath, unix.O_WRONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		fmt.Println("open failed")
-		return &os.PathError{Op: "open exec fifo", Path: fifoPath, Err: err}
+		fmt.Println("[child] open failed")
+		return &os.PathError{Op: "[child] open exec fifo", Path: fifoPath, Err: err}
 	}
-	fmt.Println("sending fifofd 0")
+	fmt.Println("[child] sending fifofd 0")
 	if _, err := unix.Write(fd, []byte("0")); err != nil {
-		fmt.Println("write failed")
-		return &os.PathError{Op: "write exec fifo", Path: fifoPath, Err: err}
+		fmt.Println("[child] write failed")
+		return &os.PathError{Op: "[child] write exec fifo", Path: fifoPath, Err: err}
 	}
-	fmt.Println("/proc/self/fd closing")
+	fmt.Println("[child] /proc/self/fd closing")
 	_ = unix.Close(fifofd)
 	//TODO: setupnetwork
 	//TODO: setuproute
 	//TODO: prepareRootfs
 	//TODO: createConsole
 	cmd := exec.Command(argv[0], argv[1:]...)
-	fmt.Printf("cmd is %s\n", cmd)
+	fmt.Printf("[child] cmd is %s\n", cmd)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
