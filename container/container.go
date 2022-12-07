@@ -199,17 +199,20 @@ func (p *initProcess) start() error {
 		fmt.Println("[parent] initwaiter fails")
 		return err
 	}
+	fmt.Println("[parent] initwaiter() ok!")
 
 	childPid, err := p.getChildPid()
 	if err != nil {
 		fmt.Printf("[parent] childPid: %s\n", err)
 		panic(err)
 	}
+	fmt.Println("[parent] getChildPid() ok!")
 	fds, err := getPipeFds(childPid)
 	if err != nil {
 		fmt.Printf("[parent] error getting pipe fds for pid: %d\n", childPid)
 		panic(err)
 	}
+	fmt.Println("[parent] getPipeFds() ok!")
 	p.fds = fds
 
 	err = p.cmd.Wait()
@@ -252,6 +255,7 @@ func initWaiter(r io.Reader) chan error {
 func (p *initProcess) getChildPid() (int, error) {
 	var pid pid
 	if err := json.NewDecoder(p.messageSockPair.parent).Decode(&pid); err != nil {
+		fmt.Printf("[parent] getChildPid()'s error: %v\n", err)
 		_ = p.cmd.Wait()
 		return -1, err
 	}
@@ -321,8 +325,9 @@ type syncT struct {
 }
 
 func writeSyncWithFd(pipe io.Writer, sync syncType, fd int) error {
-	inited := make([]byte, 1)
+	inited := make([]byte, 2)
 	inited[0] = 0
+	inited[1] = 1
 	if _, err := pipe.Write(inited); err != nil {
 		return fmt.Errorf("[parent] writing syncT %q: %w", string(sync), err)
 	}

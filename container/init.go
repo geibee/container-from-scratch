@@ -64,7 +64,6 @@ func Initialization(ctx *cli.Context) error {
 	}
 	fmt.Println("[child] writed to child side of sockpair")
 	_ = pipe.Close()
-	fmt.Printf("[child] setting /proc/self/fd/%s\n", envFifoFd)
 	fifoPath := "/proc/self/fd/" + envFifoFd
 	// Tips: ここで、fifoがもう一方から開かれるのを待ち受ける。
 	fd, err := unix.Open(fifoPath, unix.O_WRONLY|unix.O_CLOEXEC, 0)
