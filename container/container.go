@@ -9,9 +9,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sys/unix"
 )
@@ -27,6 +29,7 @@ type initProcess struct {
 	fds             []string
 	fifo            *os.File
 	m               sync.Mutex
+	bootstrapData   io.Reader
 }
 
 type pid struct {
@@ -87,10 +90,40 @@ func Run(ctx *cli.Context) error {
 	cmd.Env = append(cmd.Env,
 		"_LIBCONTAINER_FIFOFD="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
 
+	// runcでデフォルトで設定されるnamespaceをmapにする
+	nsMaps := make(map[configs.NamespaceType]string)
+	var (
+		namespaces       configs.Namespaces
+		namespaceMapping map[string]configs.NamespaceType
+	)
+
+	// runcではLinuxNamespaceTypeをNamespaceTypeに変換するために存在する。
+	// linux以外で使う想定がないので簡略化
+	namespaceMapping = map[string]configs.NamespaceType{
+		"PID":     configs.NEWPID,
+		"Network": configs.NEWNET,
+		"Mount":   configs.NEWNS,
+		"User":    configs.NEWUSER,
+		"IPC":     configs.NEWIPC,
+		"UTS":     configs.NEWUTS,
+		"Cgroup":  configs.NEWCGROUP,
+	}
+
+	for _, nsType := range []string{"PID", "Network", "IPC", "UTS", "MOUNT"} {
+		// Goでは、Mapのキーを参照すると値とキーの存在有無のboolが返却される
+		t, _ := namespaceMapping[nsType]
+		// 本当はLinuxのNamespaceのPathはnetだったりmntだったりする
+		// LinuxNamespace型を作るのが面倒なので、mountとnetworkディレクトリでよしとする
+		namespaces.Add(t, "/proc/self/ns/"+strings.ToLower(nsType))
+	}
+
+	data, err := bootstrapData(namespaces.CloneFlags(), nsMaps, initStandard)
+
 	init := &initProcess{
 		cmd:             cmd,
 		messageSockPair: messageSockPair,
 		fifo:            fifo,
+		bootstrapData:   data,
 	}
 
 	// if err := init.start(); err != nil {
@@ -189,12 +222,11 @@ func (p *initProcess) start() error {
 	// 	fmt.Println("io.Copy")
 	// 	return fmt.Errorf("can't copy bootstrap data to pipe: %w", err)
 	// }
+	if _, err := io.Copy(p.messageSockPair.parent, p.bootstrapData); err != nil {
+		return fmt.Errorf("[parent] can't copy bootstrap data to pipe: %w", err)
+	}
+
 	err = <-waitInit
-	defer func() {
-		if err != nil {
-			fmt.Printf("[parent] child side sends nothing")
-		}
-	}()
 	if err != nil {
 		fmt.Println("[parent] initwaiter fails")
 		return err
@@ -325,9 +357,8 @@ type syncT struct {
 }
 
 func writeSyncWithFd(pipe io.Writer, sync syncType, fd int) error {
-	inited := make([]byte, 2)
+	inited := make([]byte, 1)
 	inited[0] = 0
-	inited[1] = 1
 	if _, err := pipe.Write(inited); err != nil {
 		return fmt.Errorf("[parent] writing syncT %q: %w", string(sync), err)
 	}
@@ -349,4 +380,135 @@ func Start(process *initProcess) error {
 		return err
 	}
 	return nil
+}
+
+type initType string
+
+const (
+	initSetns    initType = "setns"
+	initStandard initType = "standard"
+)
+
+func bootstrapData(cloneFlags uintptr, nsMaps map[configs.NamespaceType]string, it initType) (_ io.Reader, Err error) {
+	// // create the netlink message
+	// r := nl.NewNetlinkRequest(int(InitMsg), 0)
+
+	// // Our custom messages cannot bubble up an error using returns, instead
+	// // they will panic with the specific error type, netlinkError. In that
+	// // case, recover from the panic and return that as an error.
+	// defer func() {
+	// 	if r := recover(); r != nil {
+	// 		if e, ok := r.(netlinkError); ok {
+	// 			Err = e.error
+	// 		} else {
+	// 			panic(r)
+	// 		}
+	// 	}
+	// }()
+
+	// // write cloneFlags
+	// r.AddData(&Int32msg{
+	// 	Type:  CloneFlagsAttr,
+	// 	Value: uint32(cloneFlags),
+	// })
+
+	// // write custom namespace paths
+	// if len(nsMaps) > 0 {
+	// 	nsPaths, err := c.orderNamespacePaths(nsMaps)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	r.AddData(&Bytemsg{
+	// 		Type:  NsPathsAttr,
+	// 		Value: []byte(strings.Join(nsPaths, ",")),
+	// 	})
+	// }
+
+	// // write namespace paths only when we are not joining an existing user ns
+	// _, joinExistingUser := nsMaps[configs.NEWUSER]
+	// if !joinExistingUser {
+	// 	// write uid mappings
+	// 	if len(c.config.UidMappings) > 0 {
+	// 		if c.config.RootlessEUID {
+	// 			// We resolve the paths for new{u,g}idmap from
+	// 			// the context of runc to avoid doing a path
+	// 			// lookup in the nsexec context.
+	// 			if path, err := execabs.LookPath("newuidmap"); err == nil {
+	// 				r.AddData(&Bytemsg{
+	// 					Type:  UidmapPathAttr,
+	// 					Value: []byte(path),
+	// 				})
+	// 			}
+	// 		}
+	// 		b, err := encodeIDMapping(c.config.UidMappings)
+	// 		if err != nil {
+	// 			return nil, err
+	// 		}
+	// 		r.AddData(&Bytemsg{
+	// 			Type:  UidmapAttr,
+	// 			Value: b,
+	// 		})
+	// 	}
+
+	// 	// write gid mappings
+	// 	if len(c.config.GidMappings) > 0 {
+	// 		b, err := encodeIDMapping(c.config.GidMappings)
+	// 		if err != nil {
+	// 			return nil, err
+	// 		}
+	// 		r.AddData(&Bytemsg{
+	// 			Type:  GidmapAttr,
+	// 			Value: b,
+	// 		})
+	// 		if c.config.RootlessEUID {
+	// 			if path, err := execabs.LookPath("newgidmap"); err == nil {
+	// 				r.AddData(&Bytemsg{
+	// 					Type:  GidmapPathAttr,
+	// 					Value: []byte(path),
+	// 				})
+	// 			}
+	// 		}
+	// 		if requiresRootOrMappingTool(c.config) {
+	// 			r.AddData(&Boolmsg{
+	// 				Type:  SetgroupAttr,
+	// 				Value: true,
+	// 			})
+	// 		}
+	// 	}
+	// }
+
+	// if c.config.OomScoreAdj != nil {
+	// 	// write oom_score_adj
+	// 	r.AddData(&Bytemsg{
+	// 		Type:  OomScoreAdjAttr,
+	// 		Value: []byte(strconv.Itoa(*c.config.OomScoreAdj)),
+	// 	})
+	// }
+
+	// // write rootless
+	// r.AddData(&Boolmsg{
+	// 	Type:  RootlessEUIDAttr,
+	// 	Value: c.config.RootlessEUID,
+	// })
+
+	// // Bind mount source to open.
+	// if it == initStandard && c.shouldSendMountSources() {
+	// 	var mounts []byte
+	// 	for _, m := range c.config.Mounts {
+	// 		if m.IsBind() {
+	// 			if strings.IndexByte(m.Source, 0) >= 0 {
+	// 				return nil, fmt.Errorf("mount source string contains null byte: %q", m.Source)
+	// 			}
+	// 			mounts = append(mounts, []byte(m.Source)...)
+	// 		}
+	// 		mounts = append(mounts, byte(0))
+	// 	}
+
+	// 	r.AddData(&Bytemsg{
+	// 		Type:  MountSourcesAttr,
+	// 		Value: mounts,
+	// 	})
+	// }
+
+	// return bytes.NewReader(r.Serialize()), nil
 }
