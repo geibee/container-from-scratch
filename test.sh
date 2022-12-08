@@ -11,3 +11,4 @@ fi
 str="$(IFS=,; echo "${@}")"
 go build -o cfs 
 sudo ./cfs run --command "$str"
+rm ./cfs
