@@ -126,6 +126,7 @@ func Run(ctx *cli.Context) error {
 		}
 	}
 
+	// TODO: CloneFlagsが無効な値になっている可能性が高い
 	data, err := bootstrapData(namespaces.CloneFlags(), nsMaps, initStandard)
 
 	init := &initProcess{
