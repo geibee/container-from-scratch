@@ -1,10 +1,12 @@
 package container
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/urfave/cli/v2"
+	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
 )
 
@@ -90,8 +93,6 @@ func Run(ctx *cli.Context) error {
 	cmd.Env = append(cmd.Env,
 		"_LIBCONTAINER_FIFOFD="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
 
-	// runcでデフォルトで設定されるnamespaceをmapにする
-	nsMaps := make(map[configs.NamespaceType]string)
 	var (
 		namespaces       configs.Namespaces
 		namespaceMapping map[string]configs.NamespaceType
@@ -115,6 +116,14 @@ func Run(ctx *cli.Context) error {
 		// 本当はLinuxのNamespaceのPathはnetだったりmntだったりする
 		// LinuxNamespace型を作るのが面倒なので、mountとnetworkディレクトリでよしとする
 		namespaces.Add(t, "/proc/self/ns/"+strings.ToLower(nsType))
+	}
+
+	// runcでデフォルトで設定されるnamespaceをmapにする
+	nsMaps := make(map[configs.NamespaceType]string)
+	for _, ns := range namespaces {
+		if ns.Path != "" {
+			nsMaps[ns.Type] = ns.Path
+		}
 	}
 
 	data, err := bootstrapData(namespaces.CloneFlags(), nsMaps, initStandard)
@@ -216,15 +225,10 @@ func (p *initProcess) start() error {
 	waitInit := initWaiter(p.messageSockPair.parent)
 
 	// bootstrapdata stub
-	// testrd := os.NewFile(uintptr(5), "test-reader")
-	// testrd.Write([]byte("0"))
-	// if _, err := io.Copy(p.messageSockPair.parent, testrd); err != nil {
-	// 	fmt.Println("io.Copy")
-	// 	return fmt.Errorf("can't copy bootstrap data to pipe: %w", err)
-	// }
 	if _, err := io.Copy(p.messageSockPair.parent, p.bootstrapData); err != nil {
 		return fmt.Errorf("[parent] can't copy bootstrap data to pipe: %w", err)
 	}
+	fmt.Printf("[parent] copy from bootstrapData to parent sockpair ok!")
 
 	err = <-waitInit
 	if err != nil {
@@ -389,126 +393,107 @@ const (
 	initStandard initType = "standard"
 )
 
+const (
+	InitMsg          uint16 = 62000
+	CloneFlagsAttr   uint16 = 27281
+	NsPathsAttr      uint16 = 27282
+	UidmapAttr       uint16 = 27283
+	GidmapAttr       uint16 = 27284
+	SetgroupAttr     uint16 = 27285
+	OomScoreAdjAttr  uint16 = 27286
+	RootlessEUIDAttr uint16 = 27287
+	UidmapPathAttr   uint16 = 27288
+	GidmapPathAttr   uint16 = 27289
+	MountSourcesAttr uint16 = 27290
+)
+
+type Int32msg struct {
+	Type  uint16
+	Value uint32
+}
+
+// netlinkErrorでerrorをラップすることで、recover()がpanicを制御できるようにする
+type netlinkError struct{ error }
+
+// AddData()の引数のNetlinkRequestDataインターフェースを満たすためには、Serialize()とLen()を実装する必要がある
+func (msg *Int32msg) Serialize() []byte {
+	buf := make([]byte, msg.Len())
+	native := nl.NativeEndian()
+	native.PutUint16(buf[0:2], uint16(msg.Len()))
+	native.PutUint16(buf[2:4], msg.Type)
+	native.PutUint32(buf[4:8], msg.Value)
+	return buf
+}
+
+func (msg *Int32msg) Len() int {
+	return unix.NLA_HDRLEN + 4
+}
+
+type Bytemsg struct {
+	Type  uint16
+	Value []byte
+}
+
+// AddData()の引数のNetlinkRequestDataインターフェースを満たすためには、Serialize()とLen()を実装する必要がある
+func (msg *Bytemsg) Serialize() []byte {
+	l := msg.Len()
+	if l > math.MaxUint16 {
+		// We cannot return nil nor an error here, so we panic with
+		// a specific type instead, which is handled via recover in
+		// bootstrapData.
+		panic(netlinkError{fmt.Errorf("netlink: cannot serialize bytemsg of length %d (larger than UINT16_MAX)", l)})
+	}
+	buf := make([]byte, (l+unix.NLA_ALIGNTO-1) & ^(unix.NLA_ALIGNTO-1))
+	native := nl.NativeEndian()
+	native.PutUint16(buf[0:2], uint16(l))
+	native.PutUint16(buf[2:4], msg.Type)
+	copy(buf[4:], msg.Value)
+	return buf
+}
+
+func (msg *Bytemsg) Len() int {
+	return unix.NLA_HDRLEN + len(msg.Value) + 1 // null-terminated
+}
+
 func bootstrapData(cloneFlags uintptr, nsMaps map[configs.NamespaceType]string, it initType) (_ io.Reader, Err error) {
-	// // create the netlink message
-	// r := nl.NewNetlinkRequest(int(InitMsg), 0)
+	// TODO: これが何をしているのかをちゃんと理解する
+	r := nl.NewNetlinkRequest(int(InitMsg), 0)
 
-	// // Our custom messages cannot bubble up an error using returns, instead
-	// // they will panic with the specific error type, netlinkError. In that
-	// // case, recover from the panic and return that as an error.
-	// defer func() {
-	// 	if r := recover(); r != nil {
-	// 		if e, ok := r.(netlinkError); ok {
-	// 			Err = e.error
-	// 		} else {
-	// 			panic(r)
-	// 		}
-	// 	}
-	// }()
+	// netlinkErrorが発生したときにpanicさせず、errとして返却させる
+	defer func() {
+		// recover()はpanicしたgoroutineのふるまいを管理できるようにする。
+		// ここでは、netlinkErrorだったらErrとして返却する
+		if r := recover(); r != nil {
+			if e, ok := r.(netlinkError); ok {
+				Err = e.error
+			} else {
+				panic(r)
+			}
+		}
+	}()
 
-	// // write cloneFlags
-	// r.AddData(&Int32msg{
-	// 	Type:  CloneFlagsAttr,
-	// 	Value: uint32(cloneFlags),
-	// })
+	fmt.Printf("[parent] cloneFlags in bootstrapData(): %d\n", uint32(cloneFlags))
+	// CloneFlagをreaderに送る
+	r.AddData(&Int32msg{
+		Type:  CloneFlagsAttr,
+		Value: uint32(cloneFlags),
+	})
 
-	// // write custom namespace paths
-	// if len(nsMaps) > 0 {
-	// 	nsPaths, err := c.orderNamespacePaths(nsMaps)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	r.AddData(&Bytemsg{
-	// 		Type:  NsPathsAttr,
-	// 		Value: []byte(strings.Join(nsPaths, ",")),
-	// 	})
-	// }
+	// namespaceのPathをコンマ区切りで連結する
+	paths := []string{}
+	for _, ns := range configs.NamespaceTypes() {
+		if p, ok := nsMaps[ns]; ok && p != "" {
+			paths = append(paths, fmt.Sprintf("%s:%s", configs.NsName(ns), nsMaps[ns]))
+		}
+	}
 
-	// // write namespace paths only when we are not joining an existing user ns
-	// _, joinExistingUser := nsMaps[configs.NEWUSER]
-	// if !joinExistingUser {
-	// 	// write uid mappings
-	// 	if len(c.config.UidMappings) > 0 {
-	// 		if c.config.RootlessEUID {
-	// 			// We resolve the paths for new{u,g}idmap from
-	// 			// the context of runc to avoid doing a path
-	// 			// lookup in the nsexec context.
-	// 			if path, err := execabs.LookPath("newuidmap"); err == nil {
-	// 				r.AddData(&Bytemsg{
-	// 					Type:  UidmapPathAttr,
-	// 					Value: []byte(path),
-	// 				})
-	// 			}
-	// 		}
-	// 		b, err := encodeIDMapping(c.config.UidMappings)
-	// 		if err != nil {
-	// 			return nil, err
-	// 		}
-	// 		r.AddData(&Bytemsg{
-	// 			Type:  UidmapAttr,
-	// 			Value: b,
-	// 		})
-	// 	}
+	// コンマ区切りで連結したnamespaceのPathをreaderに送る
+	r.AddData(&Bytemsg{
+		Type:  NsPathsAttr,
+		Value: []byte(strings.Join(paths, ",")),
+	})
 
-	// 	// write gid mappings
-	// 	if len(c.config.GidMappings) > 0 {
-	// 		b, err := encodeIDMapping(c.config.GidMappings)
-	// 		if err != nil {
-	// 			return nil, err
-	// 		}
-	// 		r.AddData(&Bytemsg{
-	// 			Type:  GidmapAttr,
-	// 			Value: b,
-	// 		})
-	// 		if c.config.RootlessEUID {
-	// 			if path, err := execabs.LookPath("newgidmap"); err == nil {
-	// 				r.AddData(&Bytemsg{
-	// 					Type:  GidmapPathAttr,
-	// 					Value: []byte(path),
-	// 				})
-	// 			}
-	// 		}
-	// 		if requiresRootOrMappingTool(c.config) {
-	// 			r.AddData(&Boolmsg{
-	// 				Type:  SetgroupAttr,
-	// 				Value: true,
-	// 			})
-	// 		}
-	// 	}
-	// }
-
-	// if c.config.OomScoreAdj != nil {
-	// 	// write oom_score_adj
-	// 	r.AddData(&Bytemsg{
-	// 		Type:  OomScoreAdjAttr,
-	// 		Value: []byte(strconv.Itoa(*c.config.OomScoreAdj)),
-	// 	})
-	// }
-
-	// // write rootless
-	// r.AddData(&Boolmsg{
-	// 	Type:  RootlessEUIDAttr,
-	// 	Value: c.config.RootlessEUID,
-	// })
-
-	// // Bind mount source to open.
-	// if it == initStandard && c.shouldSendMountSources() {
-	// 	var mounts []byte
-	// 	for _, m := range c.config.Mounts {
-	// 		if m.IsBind() {
-	// 			if strings.IndexByte(m.Source, 0) >= 0 {
-	// 				return nil, fmt.Errorf("mount source string contains null byte: %q", m.Source)
-	// 			}
-	// 			mounts = append(mounts, []byte(m.Source)...)
-	// 		}
-	// 		mounts = append(mounts, byte(0))
-	// 	}
-
-	// 	r.AddData(&Bytemsg{
-	// 		Type:  MountSourcesAttr,
-	// 		Value: mounts,
-	// 	})
-	// }
-
-	// return bytes.NewReader(r.Serialize()), nil
+	// TODO: Bind Mountの設定
+	fmt.Printf("[parent] r.Seliarize() in bootstrapData() is %s\n", string(r.Serialize()))
+	return bytes.NewReader(r.Serialize()), nil
 }
