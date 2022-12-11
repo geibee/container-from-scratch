@@ -63,7 +63,7 @@ func Initialization(ctx *cli.Context) error {
 		return fmt.Errorf("[child] sync ready: %w", err)
 	}
 	fmt.Println("[child] writed to child side of sockpair")
-	_ = pipe.Close()
+	// _ = pipe.Close()
 	fifoPath := "/proc/self/fd/" + envFifoFd
 	// Tips: ここで、fifoがもう一方から開かれるのを待ち受ける。
 	fd, err := unix.Open(fifoPath, unix.O_WRONLY|unix.O_CLOEXEC, 0)
