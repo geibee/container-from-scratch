@@ -465,7 +465,9 @@ func bootstrapData(cloneFlags uintptr, nsMaps map[configs.NamespaceType]string, 
 		// recover()はpanicしたgoroutineのふるまいを管理できるようにする。
 		// ここでは、netlinkErrorだったらErrとして返却する
 		if r := recover(); r != nil {
+			fmt.Println("[parent] recover()")
 			if e, ok := r.(netlinkError); ok {
+				fmt.Printf("[parent] netlinkError %s\n", e)
 				Err = e.error
 			} else {
 				panic(r)
