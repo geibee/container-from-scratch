@@ -1,3 +1,4 @@
+mkdir -p tmp
 rm tmp/exec.fifo > /dev/null 2>&1
 rm ./cfs > /dev/null 2>&1
 if ls rootfs > /dev/null 2>&1; then
