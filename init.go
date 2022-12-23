@@ -3,6 +3,8 @@ package main
 import (
 	"regmarmcem/container-from-scratch/container"
 
+	_ "github.com/opencontainers/runc/libcontainer/nsenter"
+
 	"github.com/urfave/cli/v2"
 )
 

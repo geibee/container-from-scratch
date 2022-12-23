@@ -10,6 +10,6 @@ else
     rm rootfs.tar
 fi
 str="$(IFS=,; echo "${@}")"
-go build -o cfs 
+go build -o cfs -tags=linux
 sudo ./cfs run --command "$str"
 rm ./cfs
