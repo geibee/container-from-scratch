@@ -115,7 +115,11 @@ func Run(ctx *cli.Context) error {
 		t, _ := namespaceMapping[nsType]
 		// 本当はLinuxのNamespaceのPathはnetだったりmntだったりする
 		// LinuxNamespace型を作るのが面倒なので、mountとnetworkディレクトリでよしとする
-		namespaces.Add(t, "/proc/self/ns/"+strings.ToLower(nsType))
+		if nsType == "Network" {
+			namespaces.Add(t, "/proc/self/ns/net")
+		} else {
+			namespaces.Add(t, "/proc/self/ns/"+strings.ToLower(nsType))
+		}
 	}
 
 	// runcでデフォルトで設定されるnamespaceをmapにする
