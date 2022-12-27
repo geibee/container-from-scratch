@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/urfave/cli/v2"
 	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
@@ -115,6 +116,7 @@ func Run(ctx *cli.Context) error {
 		t, _ := namespaceMapping[nsType]
 		// 本当はLinuxのNamespaceのPathはnetだったりmntだったりする
 		// LinuxNamespace型を作るのが面倒なので、mountとnetworkディレクトリでよしとする
+		// 20221223追記: ns/networkはnsexec()に怒られるので、netにする
 		if nsType == "Network" {
 			namespaces.Add(t, "/proc/self/ns/net")
 		} else {
@@ -256,16 +258,56 @@ func (p *initProcess) start() error {
 	fmt.Println("[parent] getPipeFds() ok!")
 	p.fds = fds
 
-	err = p.cmd.Wait()
+	err = p.waitForChildExit(childPid)
 	if err != nil {
-		fmt.Println("[parent] p.cmd.Wait() failed.")
-		return err
+		return fmt.Errorf("[parent] error waiting for our first child to exit: %w", err)
 	}
 
+	ierr := parseSync(p.messageSockPair.parent, func(sync *syncT) error {
+		switch sync.Type {
+		case procHooks:
+			fmt.Println("[parent] case procHooks")
+			return nil
+		case procReady:
+			fmt.Println("[parent] case procReady")
+			return nil
+		default:
+			fmt.Println("[parent] case default")
+			return errors.New("invalid JSON payload from child")
+		}
+	})
+
+	if ierr != nil {
+		fmt.Println("[parent] parseSync failed: ierr isn't nil")
+		_ = p.cmd.Wait()
+		return ierr
+	}
+
+	fmt.Println("[parent] unix Shutdown")
 	if err := unix.Shutdown(int(p.messageSockPair.parent.Fd()), unix.SHUT_WR); err != nil {
 		return &os.PathError{Op: "shutdown", Path: "(init pipe)", Err: err}
 	}
 
+	return nil
+}
+
+func parseSync(pipe io.Reader, fn func(*syncT) error) error {
+	fmt.Println("[parent] running parseSync - reading from pipe")
+	dec := json.NewDecoder(pipe)
+	for {
+		var sync syncT
+		if err := dec.Decode(&sync); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			fmt.Printf("[parent] running parseSync - error is %s\n", err)
+			return err
+		}
+
+		if err := fn(&sync); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -324,8 +366,24 @@ func getPipeFds(pid int) ([]string, error) {
 	return fds, nil
 }
 
-func setupNetwork() {
+func (p *initProcess) waitForChildExit(childPid int) error {
+	status, err := p.cmd.Process.Wait()
+	if err != nil {
+		_ = p.cmd.Wait()
+		return err
+	}
+	if !status.Success() {
+		_ = p.cmd.Wait()
+		return &exec.ExitError{ProcessState: status}
+	}
 
+	process, err := os.FindProcess(childPid)
+	if err != nil {
+		return err
+	}
+	p.cmd.Process = process
+	// p.process.ops = p
+	return nil
 }
 
 func Must(err error) {
@@ -368,12 +426,9 @@ type syncT struct {
 func writeSyncWithFd(pipe io.Writer, sync syncType, fd int) error {
 	inited := make([]byte, 1)
 	inited[0] = 0
-	if _, err := pipe.Write(inited); err != nil {
+	if err := utils.WriteJSON(pipe, syncT{sync, fd}); err != nil {
 		return fmt.Errorf("[parent] writing syncT %q: %w", string(sync), err)
 	}
-	// if err := utils.WriteJSON(pipe, syncT{sync, fd}); err != nil {
-	// return fmt.Errorf("[parent] writing syncT %q: %w", string(sync), err)
-	// }
 	return nil
 }
 
