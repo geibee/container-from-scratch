@@ -57,6 +57,12 @@ func Initialization(ctx *cli.Context) error {
 	*
 	 */
 
+	//TODO: setupnetwork
+	//TODO: setuproute
+	// prepareRootfs: これをやらなければ、procHooksがchildから送られない。
+
+	//TODO: createConsole
+
 	// 親プロセスとつながったSocketPairの子供側に書き込む。これによって、runc runの親プロセスのソケットが先に進む
 	if err := writeSyncWithFd(pipe, procReady, -1); err != nil {
 		fmt.Printf("[child] error is %s\n", err)
@@ -66,6 +72,7 @@ func Initialization(ctx *cli.Context) error {
 	// _ = pipe.Close()
 	fifoPath := "/proc/self/fd/" + envFifoFd
 	// Tips: ここで、fifoがもう一方から開かれるのを待ち受ける。
+	fmt.Println("[child] opening fifo")
 	fd, err := unix.Open(fifoPath, unix.O_WRONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		fmt.Println("[child] open failed")
@@ -78,10 +85,6 @@ func Initialization(ctx *cli.Context) error {
 	}
 	fmt.Println("[child] /proc/self/fd closing")
 	_ = unix.Close(fifofd)
-	//TODO: setupnetwork
-	//TODO: setuproute
-	//TODO: prepareRootfs
-	//TODO: createConsole
 	cmd := exec.Command(argv[0], argv[1:]...)
 	fmt.Printf("[child] cmd is %s\n", cmd)
 	cmd.Stdin = os.Stdin
