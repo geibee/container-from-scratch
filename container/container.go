@@ -150,7 +150,7 @@ func Run(ctx *cli.Context) error {
 		return err
 	}
 
-	fifo.Close()
+	// fifo.Close()
 	blockingFifoOpenCh := awaitFifoOpen(fifoName)
 	for {
 		select {
@@ -172,6 +172,7 @@ type openResult struct {
 }
 
 func awaitFifoOpen(path string) <-chan openResult {
+	fmt.Println("[parent] awaitFifoOpen")
 	fifoOpened := make(chan openResult)
 	go func() {
 		result := fifoOpen(path, true)
@@ -267,16 +268,17 @@ func (p *initProcess) start() error {
 		switch sync.Type {
 		case procHooks:
 			fmt.Println("[parent] case procHooks")
-			return nil
 		case procReady:
 			fmt.Println("[parent] case procReady")
-			return nil
 		default:
 			fmt.Println("[parent] case default")
 			return errors.New("invalid JSON payload from child")
 		}
+		fmt.Println("[parent] parseSync returning")
+		return nil
 	})
 
+	fmt.Println("[parent] parseSync done")
 	if ierr != nil {
 		fmt.Println("[parent] parseSync failed: ierr isn't nil")
 		_ = p.cmd.Wait()
@@ -308,6 +310,7 @@ func parseSync(pipe io.Reader, fn func(*syncT) error) error {
 			return err
 		}
 	}
+	fmt.Println("[parent] running parseSync - returning nil")
 	return nil
 }
 
