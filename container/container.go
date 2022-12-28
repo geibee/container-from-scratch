@@ -298,6 +298,7 @@ func parseSync(pipe io.Reader, fn func(*syncT) error) error {
 	for {
 		var sync syncT
 		if err := dec.Decode(&sync); err != nil {
+			// TODO: 子プロセスがEOFを送るように実装する必要がある
 			if errors.Is(err, io.EOF) {
 				break
 			}
@@ -308,6 +309,8 @@ func parseSync(pipe io.Reader, fn func(*syncT) error) error {
 		if err := fn(&sync); err != nil {
 			return err
 		} else {
+			// TODO: 子プロセスがEOFを送るように実装する必要がある。
+			// とりあえずfnが呼ばれたらbreakするようにして先に進める
 			break
 		}
 	}
