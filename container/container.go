@@ -294,7 +294,6 @@ func (p *initProcess) start() error {
 }
 
 func parseSync(pipe io.Reader, fn func(*syncT) error) error {
-	fmt.Println("[parent] running parseSync - reading from pipe")
 	dec := json.NewDecoder(pipe)
 	for {
 		var sync syncT
@@ -308,6 +307,8 @@ func parseSync(pipe io.Reader, fn func(*syncT) error) error {
 
 		if err := fn(&sync); err != nil {
 			return err
+		} else {
+			break
 		}
 	}
 	fmt.Println("[parent] running parseSync - returning nil")
@@ -427,8 +428,6 @@ type syncT struct {
 }
 
 func writeSyncWithFd(pipe io.Writer, sync syncType, fd int) error {
-	inited := make([]byte, 1)
-	inited[0] = 0
 	if err := utils.WriteJSON(pipe, syncT{sync, fd}); err != nil {
 		return fmt.Errorf("[parent] writing syncT %q: %w", string(sync), err)
 	}
