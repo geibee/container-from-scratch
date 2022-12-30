@@ -1,19 +1,24 @@
 package container
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
+	"sync"
+	"time"
 
+	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/urfave/cli/v2"
+	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
 )
 
@@ -26,6 +31,9 @@ type initProcess struct {
 	cmd             *exec.Cmd
 	messageSockPair filePair
 	fds             []string
+	fifo            *os.File
+	m               sync.Mutex
+	bootstrapData   io.Reader
 }
 
 type pid struct {
@@ -35,70 +43,280 @@ type pid struct {
 
 const stdioFdCount = 3
 
-func Run(ctx *cli.Context) {
+func Run(ctx *cli.Context) error {
 	command := ctx.String("command")
 	argv := append([]string{"--command"}, command)
 
-	fmt.Printf("cfs run... \n")
+	fmt.Println("[parent] cfs run...")
 	parentInitPipe, childInitPipe, err := NewSockPair("init")
 	if err != nil {
-		fmt.Printf("unable to create init pipe")
-		panic(err)
+		return fmt.Errorf("[parent] unable to create init pipe: %s", err)
 	}
 
 	messageSockPair := filePair{parentInitPipe, childInitPipe}
+
+	fmt.Println("[parent] creating fifo")
+	//TODO: 本当はrootオプションの直下に作成する
+	fifoName := "tmp/exec.fifo"
+	if _, err := os.Stat(fifoName); err == nil {
+		return fmt.Errorf("[parent] exec fifo %s already exists", fifoName)
+	}
+
+	oldMask := unix.Umask(0o000)
+	if err := unix.Mkfifo(fifoName, 0o622); err != nil {
+		unix.Umask(oldMask)
+		return err
+	}
+	unix.Umask(oldMask)
+	// if err := os.Chown(fifoName, 1, 1); err != nil {
+	// 	return fmt.Errorf("exec fifo %s chown failed", fifoName)
+	// }
+
+	// newParentProcess()の中で、fifoを開いてそれをExtraFilesに加えたcmdが作成される。
+	fmt.Println("[parent] opening fifo")
+	fifo, err := os.OpenFile(fifoName, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("[parent] exec fifo %s open failed", fifoName)
+	}
 	args := append([]string{"init"}, argv...)
 	cmd := exec.Command("/proc/self/exe", args...)
-	fmt.Printf("init command option is %s \n", args)
+	fmt.Printf("[parent] init command option is %s \n", args)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	// stdin, stdout, stderr, childInitPipe, fifofdの順にfdを渡す
+	// Socketpairの子供側をExtraFilesの末尾に追加し、そのfdを環境変数に渡す
 	cmd.ExtraFiles = append(cmd.ExtraFiles, childInitPipe)
 	cmd.Env = append(cmd.Env,
 		"_LIBCONTAINER_INITPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
+	// fifoをExtraFilesの末尾に追加し、そのfdを環境変数に渡す
+	cmd.ExtraFiles = append(cmd.ExtraFiles, fifo)
+	cmd.Env = append(cmd.Env,
+		"_LIBCONTAINER_FIFOFD="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
+
+	var (
+		namespaces       configs.Namespaces
+		namespaceMapping map[string]configs.NamespaceType
+	)
+
+	// runcではLinuxNamespaceTypeをNamespaceTypeに変換するために存在する。
+	// linux以外で使う想定がないので簡略化
+	namespaceMapping = map[string]configs.NamespaceType{
+		"PID":     configs.NEWPID,
+		"Network": configs.NEWNET,
+		"Mount":   configs.NEWNS,
+		"User":    configs.NEWUSER,
+		"IPC":     configs.NEWIPC,
+		"UTS":     configs.NEWUTS,
+		"Cgroup":  configs.NEWCGROUP,
+	}
+
+	for _, nsType := range []string{"PID", "Network", "IPC", "UTS", "MOUNT"} {
+		// Goでは、Mapのキーを参照すると値とキーの存在有無のboolが返却される
+		t, _ := namespaceMapping[nsType]
+		// 本当はLinuxのNamespaceのPathはnetだったりmntだったりする
+		// LinuxNamespace型を作るのが面倒なので、mountとnetworkディレクトリでよしとする
+		// 20221223追記: ns/networkはnsexec()に怒られるので、netにする
+		if nsType == "Network" {
+			namespaces.Add(t, "/proc/self/ns/net")
+		} else {
+			namespaces.Add(t, "/proc/self/ns/"+strings.ToLower(nsType))
+		}
+	}
+
+	// runcでデフォルトで設定されるnamespaceをmapにする
+	nsMaps := make(map[configs.NamespaceType]string)
+	for _, ns := range namespaces {
+		if ns.Path != "" {
+			nsMaps[ns.Type] = ns.Path
+		}
+	}
+
+	// TODO: CloneFlagsが無効な値になっている可能性が高い
+	data, err := bootstrapData(namespaces.CloneFlags(), nsMaps, initStandard)
 
 	init := &initProcess{
 		cmd:             cmd,
 		messageSockPair: messageSockPair,
+		fifo:            fifo,
+		bootstrapData:   data,
 	}
-	init.start()
+
+	// if err := init.start(); err != nil {
+	// 	os.Remove(fifoName)
+	// 	return err
+	// }
+	if err := Start(init); err != nil {
+		return err
+	}
+
+	// fifo.Close()
+	blockingFifoOpenCh := awaitFifoOpen(fifoName)
+	for {
+		select {
+		case result := <-blockingFifoOpenCh:
+			return handleFifoResult(result)
+		case <-time.After(time.Microsecond * 100):
+			if err := handleFifoResult(fifoOpen(fifoName, false)); err != nil {
+				return errors.New("[parent] container process is already dead")
+			}
+			return nil
+		}
+	}
+
+}
+
+type openResult struct {
+	file *os.File
+	err  error
+}
+
+func awaitFifoOpen(path string) <-chan openResult {
+	fmt.Println("[parent] awaitFifoOpen")
+	fifoOpened := make(chan openResult)
+	go func() {
+		result := fifoOpen(path, true)
+		fifoOpened <- result
+	}()
+	return fifoOpened
+}
+
+func fifoOpen(path string, block bool) openResult {
+	flags := os.O_RDONLY
+	if !block {
+		flags |= unix.O_NONBLOCK
+	}
+	f, err := os.OpenFile(path, flags, 0)
+	if err != nil {
+		return openResult{err: fmt.Errorf("[parent] exec fifo: %w", err)}
+	}
+	return openResult{file: f}
+}
+
+func handleFifoResult(result openResult) error {
+	if result.err != nil {
+		return result.err
+	}
+	f := result.file
+	defer f.Close()
+	if err := readFromExecFifo(f); err != nil {
+		return err
+	}
+	return os.Remove(f.Name())
+}
+
+func readFromExecFifo(execFifo io.Reader) error {
+	data, err := io.ReadAll(execFifo)
+	if err != nil {
+		return err
+	}
+	if len(data) <= 0 {
+		return errors.New("[parent] cannot start an already running container")
+	}
+	return nil
 }
 
 /*
   cfs run(=runc run)から、cfs init(=runc init)を実行する
 */
-func (p *initProcess) start() {
-	Must(p.cmd.Run())
-}
 
-/*
-func (p *initProcess) start() {
+func (p *initProcess) start() error {
 	defer p.messageSockPair.parent.Close()
 	err := p.cmd.Start()
+	//Tips: 親側のプロセスではSocketpairの子側はいらないから閉じる
 	_ = p.messageSockPair.child.Close()
 	if err != nil {
-		fmt.Printf("initProcess start failed: %s", err)
-		panic(err)
+		return fmt.Errorf("[parent] initProcess start failed: %w", err)
 	}
-	// waitInit := initWaiter(p.messageSockPair.parent)
-	// err = <-waitInit
-	// if err != nil {
-	// 	panic(err)
-	// }
+
+	//Tips: 子側がSockpairに何か送ってきてるか確認し、何も送ってきてなかったらエラーにする
+	waitInit := initWaiter(p.messageSockPair.parent)
+
+	// bootstrapdata stub
+	if _, err := io.Copy(p.messageSockPair.parent, p.bootstrapData); err != nil {
+		return fmt.Errorf("[parent] can't copy bootstrap data to pipe: %w", err)
+	}
+	fmt.Printf("[parent] copy from bootstrapData to parent sockpair ok!")
+
+	err = <-waitInit
+	if err != nil {
+		fmt.Println("[parent] initwaiter fails")
+		return err
+	}
+	fmt.Println("[parent] initwaiter() ok!")
 
 	childPid, err := p.getChildPid()
 	if err != nil {
-		fmt.Printf("childPid: %s\n", err)
+		fmt.Printf("[parent] childPid: %s\n", err)
 		panic(err)
 	}
+	fmt.Println("[parent] getChildPid() ok!")
 	fds, err := getPipeFds(childPid)
 	if err != nil {
-		fmt.Printf("error getting pipe fds for pid: %d", childPid)
+		fmt.Printf("[parent] error getting pipe fds for pid: %d\n", childPid)
 		panic(err)
 	}
+	fmt.Println("[parent] getPipeFds() ok!")
 	p.fds = fds
+
+	err = p.waitForChildExit(childPid)
+	if err != nil {
+		return fmt.Errorf("[parent] error waiting for our first child to exit: %w", err)
+	}
+
+	ierr := parseSync(p.messageSockPair.parent, func(sync *syncT) error {
+		switch sync.Type {
+		case procHooks:
+			fmt.Println("[parent] case procHooks")
+		case procReady:
+			fmt.Println("[parent] case procReady")
+		default:
+			fmt.Println("[parent] case default")
+			return errors.New("invalid JSON payload from child")
+		}
+		fmt.Println("[parent] parseSync returning")
+		return nil
+	})
+
+	fmt.Println("[parent] parseSync done")
+	if ierr != nil {
+		fmt.Println("[parent] parseSync failed: ierr isn't nil")
+		_ = p.cmd.Wait()
+		return ierr
+	}
+
+	fmt.Println("[parent] unix Shutdown")
+	if err := unix.Shutdown(int(p.messageSockPair.parent.Fd()), unix.SHUT_WR); err != nil {
+		return &os.PathError{Op: "shutdown", Path: "(init pipe)", Err: err}
+	}
+
+	return nil
 }
-*/
+
+func parseSync(pipe io.Reader, fn func(*syncT) error) error {
+	dec := json.NewDecoder(pipe)
+	for {
+		var sync syncT
+		if err := dec.Decode(&sync); err != nil {
+			// TODO: 子プロセスがEOFを送るように実装する必要がある
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			fmt.Printf("[parent] running parseSync - error is %s\n", err)
+			return err
+		}
+
+		if err := fn(&sync); err != nil {
+			return err
+		} else {
+			// TODO: 子プロセスがEOFを送るように実装する必要がある。
+			// とりあえずfnが呼ばれたらbreakするようにして先に進める
+			break
+		}
+	}
+	fmt.Println("[parent] running parseSync - returning nil")
+	return nil
+}
 
 func initWaiter(r io.Reader) chan error {
 	ch := make(chan error, 1)
@@ -108,15 +326,18 @@ func initWaiter(r io.Reader) chan error {
 		n, err := r.Read(inited)
 		if err == nil {
 			if n < 1 {
-				err = errors.New("short read")
+				fmt.Println("[parent] short read")
+				err = errors.New("[parent] short read")
 			} else if inited[0] != 0 {
-				err = fmt.Errorf("unexpected %d != 0", inited[0])
+				fmt.Printf("[parent] init[0] is %s\n", inited[0])
+				err = fmt.Errorf("[parent] unexpected %d != 0", inited[0])
 			} else {
+				fmt.Println("[parent] ok")
 				ch <- nil
 				return
 			}
 		}
-		ch <- fmt.Errorf("waiting for init preliminary setup: %w", err)
+		ch <- fmt.Errorf("[parent] waiting for init preliminary setup: %w", err)
 	}()
 	return ch
 }
@@ -124,6 +345,7 @@ func initWaiter(r io.Reader) chan error {
 func (p *initProcess) getChildPid() (int, error) {
 	var pid pid
 	if err := json.NewDecoder(p.messageSockPair.parent).Decode(&pid); err != nil {
+		fmt.Printf("[parent] getChildPid()'s error: %v\n", err)
 		_ = p.cmd.Wait()
 		return -1, err
 	}
@@ -151,102 +373,24 @@ func getPipeFds(pid int) ([]string, error) {
 	return fds, nil
 }
 
-func setupNetwork() {
-
-}
-
-// cfs init(=runc init)の実体
-func Initialization(ctx *cli.Context) {
-	command := ctx.String("command")
-	fmt.Printf("Running %v \n", command)
-	argv := strings.Split(command, " ")
-	fmt.Printf("split argv is %s\n", argv)
-
-	envInitPipe := os.Getenv("_LIBCONTAINER_INITPIPE")
-	pipefd, err := strconv.Atoi(envInitPipe)
+func (p *initProcess) waitForChildExit(childPid int) error {
+	status, err := p.cmd.Process.Wait()
 	if err != nil {
-		err = fmt.Errorf("unable to convert _LIBCONTAINER_INITPIPE: %w", err)
-		fmt.Printf("convert %s", err)
-		panic(err)
+		_ = p.cmd.Wait()
+		return err
 	}
-	pipe := os.NewFile(uintptr(pipefd), "pipe")
-	defer pipe.Close()
-	cg()
-
-	// var consoleSocket *os.File
-	// if envConsole := os.Getenv("_LIBCONTAINER_CONSOLE"); envConsole != "" {
-	// 	console, err := strconv.Atoi(envConsole)
-	// 	if err != nil {
-	// 		return fmt.Errorf("unable to convert _LIBCONTAINER_CONSOLE: %w", err)
-	// 	}
-	// 	consoleSocket = os.NewFile(uintptr(console), "console-socket")
-	// 	defer consoleSocket.Close()
-	// }
-
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	// factory_linux.goのStartInitialization() Init()の前座
-	// standard_init_linux.goのInit() こっちがメイン処理
-	// Must(setupNetwork())
-	// Must(setupRoute())
-	/*
-		prepareRootfs()の簡易的な実装
-	*/
-	flag := unix.MS_SLAVE | unix.MS_REC
-	//Must(unix.Sethostname([]byte("container")))
-	Must(unix.Mount("", "/", "", uintptr(flag), ""))
-	Must(unix.Mount("rootfs", "/", "bind", unix.MS_BIND|unix.MS_REC, ""))
-	Must(unix.Mount("proc", "/proc", "proc", 0, ""))
-	Must(syscall.Chroot("/"))
-	Must(os.Chdir("/"))
-	Must(cmd.Run())
-	/*
-		簡単な方の実装
-		// Must(syscall.Sethostname([]byte("container")))
-		// Must(syscall.Chroot("/"))
-		// Must(os.Chdir("/"))
-		// Must(syscall.Mount("proc", "proc", "proc", 0, ""))
-		// Must(cmd.Run())
-		// Must(syscall.Unmount("proc", 0))
-	*/
-
-	/*
-		Init()の中の最後の処理
-		fifoPath := "/proc/self/fd/" + strconv.Itoa(l.fifoFd)
-		fd, err := unix.Open(fifoPath, unix.O_WRONLY|unix.O_CLOEXEC, 0)
-		if err != nil {
-			return &os.PathError{Op: "open exec fifo", Path: fifoPath, Err: err}
-		}
-		if _, err := unix.Write(fd, []byte("0")); err != nil {
-			return &os.PathError{Op: "write exec fifo", Path: fifoPath, Err: err}
-		}
-
-		_ = unix.Close(l.fifoFd)
-
-		s := l.config.SpecState
-		s.Pid = unix.Getpid()
-		s.Status = specs.StateCreated
-		if err := l.config.Config.Hooks[configs.StartContainer].RunHooks(s); err != nil {
-			return err
-		}
-
-		return system.Exec(name, l.config.Args[0:], os.Environ())
-	*/
-}
-
-func cg() {
-	cgroups := "/sys/fs/cgroup/"
-	pids := filepath.Join(cgroups, "pids")
-	cgPath := filepath.Join(pids, "cfs")
-	if !Exists(cgPath) {
-		Must(os.Mkdir(filepath.Join(pids, "cfs"), 0755))
+	if !status.Success() {
+		_ = p.cmd.Wait()
+		return &exec.ExitError{ProcessState: status}
 	}
-	Must(ioutil.WriteFile(filepath.Join(pids, "cfs/pids.max"), []byte("20"), 0700))
-	Must(ioutil.WriteFile(filepath.Join(pids, "cfs/notify_on_release"), []byte("1"), 0700))
-	Must(ioutil.WriteFile(filepath.Join(pids, "cfs/cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0700))
+
+	process, err := os.FindProcess(childPid)
+	if err != nil {
+		return err
+	}
+	p.cmd.Process = process
+	// p.process.ops = p
+	return nil
 }
 
 func Must(err error) {
@@ -271,4 +415,152 @@ func NewSockPair(name string) (parent *os.File, child *os.File, err error) {
 		return nil, nil, err
 	}
 	return os.NewFile(uintptr(fds[1]), name+"-p"), os.NewFile(uintptr(fds[0]), name+"-c"), nil
+}
+
+type syncType string
+
+const (
+	procError syncType = "procError"
+	procReady syncType = "procReady"
+	procHooks syncType = "procHooks"
+)
+
+type syncT struct {
+	Type syncType `json:"type"`
+	Fd   int      `json:"fd"`
+}
+
+func writeSyncWithFd(pipe io.Writer, sync syncType, fd int) error {
+	if err := utils.WriteJSON(pipe, syncT{sync, fd}); err != nil {
+		return fmt.Errorf("[parent] writing syncT %q: %w", string(sync), err)
+	}
+	return nil
+}
+
+type initError struct {
+	Message string `json:"message,omitempty"`
+}
+
+func Start(process *initProcess) error {
+	process.m.Lock()
+	defer process.m.Unlock()
+	if err := process.start(); err != nil {
+		os.Remove("tmp/exec.fifo")
+		return err
+	}
+	return nil
+}
+
+type initType string
+
+const (
+	initSetns    initType = "setns"
+	initStandard initType = "standard"
+)
+
+const (
+	InitMsg          uint16 = 62000
+	CloneFlagsAttr   uint16 = 27281
+	NsPathsAttr      uint16 = 27282
+	UidmapAttr       uint16 = 27283
+	GidmapAttr       uint16 = 27284
+	SetgroupAttr     uint16 = 27285
+	OomScoreAdjAttr  uint16 = 27286
+	RootlessEUIDAttr uint16 = 27287
+	UidmapPathAttr   uint16 = 27288
+	GidmapPathAttr   uint16 = 27289
+	MountSourcesAttr uint16 = 27290
+)
+
+type Int32msg struct {
+	Type  uint16
+	Value uint32
+}
+
+// netlinkErrorでerrorをラップすることで、recover()がpanicを制御できるようにする
+type netlinkError struct{ error }
+
+// AddData()の引数のNetlinkRequestDataインターフェースを満たすためには、Serialize()とLen()を実装する必要がある
+func (msg *Int32msg) Serialize() []byte {
+	buf := make([]byte, msg.Len())
+	native := nl.NativeEndian()
+	native.PutUint16(buf[0:2], uint16(msg.Len()))
+	native.PutUint16(buf[2:4], msg.Type)
+	native.PutUint32(buf[4:8], msg.Value)
+	return buf
+}
+
+func (msg *Int32msg) Len() int {
+	return unix.NLA_HDRLEN + 4
+}
+
+type Bytemsg struct {
+	Type  uint16
+	Value []byte
+}
+
+// AddData()の引数のNetlinkRequestDataインターフェースを満たすためには、Serialize()とLen()を実装する必要がある
+func (msg *Bytemsg) Serialize() []byte {
+	l := msg.Len()
+	if l > math.MaxUint16 {
+		// We cannot return nil nor an error here, so we panic with
+		// a specific type instead, which is handled via recover in
+		// bootstrapData.
+		panic(netlinkError{fmt.Errorf("netlink: cannot serialize bytemsg of length %d (larger than UINT16_MAX)", l)})
+	}
+	buf := make([]byte, (l+unix.NLA_ALIGNTO-1) & ^(unix.NLA_ALIGNTO-1))
+	native := nl.NativeEndian()
+	native.PutUint16(buf[0:2], uint16(l))
+	native.PutUint16(buf[2:4], msg.Type)
+	copy(buf[4:], msg.Value)
+	return buf
+}
+
+func (msg *Bytemsg) Len() int {
+	return unix.NLA_HDRLEN + len(msg.Value) + 1 // null-terminated
+}
+
+func bootstrapData(cloneFlags uintptr, nsMaps map[configs.NamespaceType]string, it initType) (_ io.Reader, Err error) {
+	// TODO: これが何をしているのかをちゃんと理解する
+	r := nl.NewNetlinkRequest(int(InitMsg), 0)
+
+	// netlinkErrorが発生したときにpanicさせず、errとして返却させる
+	defer func() {
+		// recover()はpanicしたgoroutineのふるまいを管理できるようにする。
+		// ここでは、netlinkErrorだったらErrとして返却する
+		if r := recover(); r != nil {
+			fmt.Println("[parent] recover()")
+			if e, ok := r.(netlinkError); ok {
+				fmt.Printf("[parent] netlinkError %s\n", e)
+				Err = e.error
+			} else {
+				panic(r)
+			}
+		}
+	}()
+
+	fmt.Printf("[parent] cloneFlags in bootstrapData(): %d\n", uint32(cloneFlags))
+	// CloneFlagをreaderに送る
+	r.AddData(&Int32msg{
+		Type:  CloneFlagsAttr,
+		Value: uint32(cloneFlags),
+	})
+
+	// namespaceのPathをコンマ区切りで連結する
+	paths := []string{}
+	for _, ns := range configs.NamespaceTypes() {
+		if p, ok := nsMaps[ns]; ok && p != "" {
+			paths = append(paths, fmt.Sprintf("%s:%s", configs.NsName(ns), nsMaps[ns]))
+		}
+	}
+
+	// コンマ区切りで連結したnamespaceのPathをreaderに送る
+	r.AddData(&Bytemsg{
+		Type:  NsPathsAttr,
+		Value: []byte(strings.Join(paths, ",")),
+	})
+
+	// TODO: Bind Mountの設定
+	fmt.Printf("[parent] r.Seliarize() in bootstrapData() is %s\n", string(r.Serialize()))
+	return bytes.NewReader(r.Serialize()), nil
 }
