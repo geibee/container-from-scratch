@@ -3,11 +3,10 @@ package container
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 
+	"github.com/opencontainers/runc/libcontainer/system"
 	"github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sys/unix"
@@ -85,11 +84,11 @@ func Initialization(ctx *cli.Context) error {
 	}
 	fmt.Println("[child] /proc/self/fd closing")
 	_ = unix.Close(fifofd)
-	cmd := exec.Command(argv[0], argv[1:]...)
-	fmt.Printf("[child] cmd is %s\n", cmd)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// cmd := exec.Command(argv[0], argv[1:]...)
+	// fmt.Printf("[child] cmd is %s\n", cmd)
+	// cmd.Stdin = os.Stdin
+	// cmd.Stdout = os.Stdout
+	// cmd.Stderr = os.Stderr
 
 	// factory_linux.goのStartInitialization() Init()の前座
 	// standard_init_linux.goのInit() こっちがメイン処理
@@ -99,12 +98,154 @@ func Initialization(ctx *cli.Context) error {
 		prepareRootfs()の簡易的な実装
 	*/
 	flag := unix.MS_SLAVE | unix.MS_REC
-	Must(unix.Sethostname([]byte("container")))
+	// Must(unix.Sethostname([]byte("container")))
 	Must(unix.Mount("", "/", "", uintptr(flag), ""))
 	Must(unix.Mount("rootfs", "/", "bind", unix.MS_BIND|unix.MS_REC, ""))
 	Must(unix.Mount("proc", "/proc", "proc", 0, ""))
-	Must(syscall.Chroot("/"))
+
+	// Must(syscall.Chroot("/"))
 	Must(os.Chdir("/"))
-	Must(cmd.Run())
+
+	environ := []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+	// Must(cmd.Run())
+
+	fmt.Printf("[child] cmd is %s\n", argv[0])
+	fmt.Printf("[child] args is %s\n", argv[1:])
+	return system.Exec(argv[0], argv[1:], environ)
+}
+
+/*
+* TODO: replace pivotRoot
+* this pivotRoot() is borrowed from libcontainer repository(https://github.com/opencontainers/runc/blob/main/libcontainer/rootfs_linux.go#L819-L874)
+ */
+
+func pivotRoot(rootfs string) error {
+
+	oldroot, err := unix.Open("/", unix.O_DIRECTORY|unix.O_RDONLY, 0)
+	if err != nil {
+		return &os.PathError{Op: "open", Path: "/", Err: err}
+	}
+	defer unix.Close(oldroot) //nolint: errcheck
+
+	newroot, err := unix.Open(rootfs, unix.O_DIRECTORY|unix.O_RDONLY, 0)
+	if err != nil {
+		return &os.PathError{Op: "open", Path: rootfs, Err: err}
+	}
+	defer unix.Close(newroot) //nolint: errcheck
+
+	// Change to the new root so that the pivot_root actually acts on it.
+	if err := unix.Fchdir(newroot); err != nil {
+		return &os.PathError{Op: "fchdir", Path: "fd " + strconv.Itoa(newroot), Err: err}
+	}
+
+	if err := unix.PivotRoot(".", "."); err != nil {
+		return &os.PathError{Op: "pivot_root", Path: ".", Err: err}
+	}
+
+	// Currently our "." is oldroot (according to the current kernel code).
+	// However, purely for safety, we will fchdir(oldroot) since there isn't
+	// really any guarantee from the kernel what /proc/self/cwd will be after a
+	// pivot_root(2).
+
+	if err := unix.Fchdir(oldroot); err != nil {
+		return &os.PathError{Op: "fchdir", Path: "fd " + strconv.Itoa(oldroot), Err: err}
+	}
+
+	// Make oldroot rslave to make sure our unmounts don't propagate to the
+	// host (and thus bork the machine). We don't use rprivate because this is
+	// known to cause issues due to races where we still have a reference to a
+	// mount while a process in the host namespace are trying to operate on
+	// something they think has no mounts (devicemapper in particular).
+	if err := mount("", ".", "", "", unix.MS_SLAVE|unix.MS_REC, ""); err != nil {
+		return err
+	}
+	// Perform the unmount. MNT_DETACH allows us to unmount /proc/self/cwd.
+	if err := unmount(".", unix.MNT_DETACH); err != nil {
+		return err
+	}
+
+	// Switch back to our shiny new root.
+	if err := unix.Chdir("/"); err != nil {
+		return &os.PathError{Op: "chdir", Path: "/", Err: err}
+	}
+	return nil
+}
+
+/*
+* TODO: replace below
+* the code below is borrowed from libcontainer repository(https://github.com/opencontainers/runc/blob/main/libcontainer/mount_linux.go)
+ */
+
+// mountError holds an error from a failed mount or unmount operation.
+type mountError struct {
+	op     string
+	source string
+	target string
+	procfd string
+	flags  uintptr
+	data   string
+	err    error
+}
+
+// Error provides a string error representation.
+func (e *mountError) Error() string {
+	out := e.op + " "
+
+	if e.source != "" {
+		out += e.source + ":" + e.target
+	} else {
+		out += e.target
+	}
+	if e.procfd != "" {
+		out += " (via " + e.procfd + ")"
+	}
+
+	if e.flags != uintptr(0) {
+		out += ", flags: 0x" + strconv.FormatUint(uint64(e.flags), 16)
+	}
+	if e.data != "" {
+		out += ", data: " + e.data
+	}
+
+	out += ": " + e.err.Error()
+	return out
+}
+
+// Unwrap returns the underlying error.
+// This is a convention used by Go 1.13+ standard library.
+func (e *mountError) Unwrap() error {
+	return e.err
+}
+
+func mount(source, target, procfd, fstype string, flags uintptr, data string) error {
+	dst := target
+	if procfd != "" {
+		dst = procfd
+	}
+	if err := unix.Mount(source, dst, fstype, flags, data); err != nil {
+		return &mountError{
+			op:     "mount",
+			source: source,
+			target: target,
+			procfd: procfd,
+			flags:  flags,
+			data:   data,
+			err:    err,
+		}
+	}
+	return nil
+}
+
+// unmount is a simple unix.Unmount wrapper.
+func unmount(target string, flags int) error {
+	err := unix.Unmount(target, flags)
+	if err != nil {
+		return &mountError{
+			op:     "unmount",
+			target: target,
+			flags:  uintptr(flags),
+			err:    err,
+		}
+	}
 	return nil
 }
